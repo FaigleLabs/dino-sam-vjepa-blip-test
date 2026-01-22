@@ -307,7 +307,7 @@ All models can be changed in Settings > Models tab.
 
 ## License
 
-[Add your license here]
+Unlicense: https://unlicense.org/
 
 ## Acknowledgments
 
