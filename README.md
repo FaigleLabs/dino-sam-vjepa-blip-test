@@ -90,8 +90,8 @@ A real-time scene understanding application that combines multiple AI models to 
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd image-caption-3
+git clone https://github.com/FaigleLabs/dino-sam-vjepa-blip-test
+cd dino-sam-vjepa-blip-test
 
 # Create virtual environment
 python -m venv .venv
