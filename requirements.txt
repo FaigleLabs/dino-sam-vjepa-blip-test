@@ -17,3 +17,6 @@ pyyaml>=6.0
 
 # Tracking (optional - Hungarian algorithm for optimal assignment)
 scipy>=1.10.0
+
+# YOLO detection (optional - alternative to SAM for faster object detection)
+ultralytics>=8.3.0

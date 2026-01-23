@@ -172,6 +172,12 @@ class RuntimeConfig:
     use_dino_boxes_for_sam: bool = False
     sam_threshold: float = 0.50
     sam_mask_threshold: float = 0.50
+
+    # Detection source: "sam" (default), "yolo11", or "yolo26"
+    detection_source: str = "sam"
+    yolo_model: str = "yolo11m"  # Specific YOLO variant (n/s/m/l/x)
+    yolo_conf_threshold: float = 0.25  # YOLO confidence threshold
+
     dino_overlay_strength: float = 0.45
     dino_blur_ksize: int = 3
     display_max_width: int = 640
@@ -702,6 +708,38 @@ def detections_from_sam(
         union_fracs[lab] = float(um.sum()) / float(h * w) if h > 0 and w > 0 else 0.0
 
     return dets, union_fracs
+
+
+def detections_from_yolo(
+    boxes: List[List[float]],
+    labels: List[str],
+    scores: List[float],
+    hw: Tuple[int, int],
+) -> Tuple[List[Detection], Dict[str, float]]:
+    """Build detections from YOLO boxes/labels/scores. Returns (detections, union_area_frac_by_label)."""
+    h, w = hw
+    dets: List[Detection] = []
+    label_areas: Dict[str, float] = {}
+
+    for i, box in enumerate(boxes):
+        if i >= len(labels) or i >= len(scores):
+            break
+        lab = str(labels[i]) if labels[i] else "object"
+        x1, y1, x2, y2 = box[:4]
+        box_area = max(0.0, (x2 - x1) * (y2 - y1))
+        area_frac = box_area / float(h * w) if h > 0 and w > 0 else 0.0
+
+        dets.append(Detection(
+            label=lab,
+            bbox_xyxy=[float(x) for x in box[:4]],
+            area_frac=area_frac,
+            score=float(scores[i])
+        ))
+
+        # Accumulate area per label (simple sum, not union since no masks)
+        label_areas[lab] = label_areas.get(lab, 0.0) + area_frac
+
+    return dets, label_areas
 
 
 class SimpleTracker:
@@ -2114,7 +2152,21 @@ class DinoV3Stage:
 
 class Sam3Stage:
     def __init__(self, model_id: str, runtime: StageRuntime, hf_token: Optional[str]):
-        from transformers import Sam3Processor, Sam3Model
+        try:
+
+            from transformers import Sam3Processor, Sam3Model
+
+        except Exception as e:
+
+            raise ImportError(
+
+                "SAM3 support is missing from your installed 'transformers'. "
+
+                "Install a version that includes SAM3 (recommended: 'pip install --upgrade --pre transformers'). "
+
+                "Alternatively, set Detection source to YOLO (yolo11/yolo26) to avoid SAM3."
+
+            ) from e
         self.proc = hf_from_pretrained(Sam3Processor, model_id, hf_token=hf_token, use_fast=True)
         self.model = hf_from_pretrained(Sam3Model, model_id, hf_token=hf_token)
         self.model = self.model.to(device=runtime.device, dtype=runtime.dtype)
@@ -2638,6 +2690,129 @@ class CaptionStage:
 
 
 # ----------------------------
+# YOLO Detection Stage
+# ----------------------------
+
+class YOLOStage:
+    """Object detection using YOLO models from Ultralytics.
+
+    Supports YOLO11 (2024) and YOLO26 (2025) with all size variants.
+    Returns detections in same format as Sam3Stage for pipeline compatibility.
+    """
+
+    YOLO11_MODELS = ["yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x"]
+    YOLO26_MODELS = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x"]
+
+    # All 80 COCO classes
+    COCO_CLASSES = [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+        "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator",
+        "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+    ]
+
+    def __init__(self, model_id: str, runtime: StageRuntime, conf_threshold: float = 0.25):
+        """Initialize YOLO stage.
+
+        Args:
+            model_id: Model name like "yolo11m" or "yolo26s"
+            runtime: StageRuntime with device info
+            conf_threshold: Confidence threshold for detections (0.0-1.0)
+        """
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ImportError(
+                "ultralytics package required for YOLO models. "
+                "Install with: pip install ultralytics>=8.3.0"
+            )
+
+        self.model_id = model_id
+        self.conf_threshold = conf_threshold
+        self.device = runtime.device
+
+        # Load model (downloads automatically if not cached)
+        self.model = YOLO(f"{model_id}.pt")
+
+        # Move to device
+        if self.device.type == "cuda":
+            self.model.to("cuda")
+        elif self.device.type == "mps":
+            self.model.to("mps")
+        # CPU is default
+
+    @torch.inference_mode()
+    def __call__(
+        self,
+        bgr: np.ndarray,
+        class_filter: Optional[List[str]] = None,
+    ) -> Tuple[List[Optional[np.ndarray]], List[List[float]], List[str], Dict[str, Any]]:
+        """Run YOLO detection.
+
+        Args:
+            bgr: Input image in BGR format (OpenCV)
+            class_filter: Optional list of class names to detect (None = all 80 classes)
+
+        Returns:
+            Tuple of (masks, boxes, labels, info) matching Sam3Stage format:
+            - masks: List of None (YOLO doesn't provide segmentation masks)
+            - boxes: List of [x1, y1, x2, y2] bounding boxes
+            - labels: List of class name strings
+            - info: Dict with scores, timings, etc.
+        """
+        t0 = time.perf_counter()
+
+        # Run inference
+        results = self.model(bgr, conf=self.conf_threshold, verbose=False)
+
+        t1 = time.perf_counter()
+
+        boxes = []
+        labels = []
+        scores = []
+
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                cls_id = int(box.cls.item())
+                cls_name = r.names[cls_id]
+
+                # Apply class filter if specified
+                if class_filter and cls_name not in class_filter:
+                    continue
+
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                boxes.append([float(x1), float(y1), float(x2), float(y2)])
+                labels.append(cls_name)
+                scores.append(float(box.conf.item()))
+
+        # YOLO doesn't provide masks - return None for each detection
+        masks = [None] * len(boxes)
+
+        info = {
+            "scores": scores,
+            "model": self.model_id,
+            "num_detections": len(boxes),
+            "ms": (t1 - t0) * 1000.0,
+            "conf_threshold": self.conf_threshold,
+        }
+
+        return masks, boxes, labels, info
+
+    @classmethod
+    def get_all_models(cls) -> List[str]:
+        """Return list of all supported YOLO models."""
+        return cls.YOLO11_MODELS + cls.YOLO26_MODELS
+
+
+# ----------------------------
 # Model container
 # ----------------------------
 
@@ -2647,6 +2822,7 @@ class LoadedModels:
     sam: Optional[Sam3Stage] = None
     vjepa: Optional[VJepa2Stage] = None
     caption: Optional[CaptionStage] = None
+    yolo: Optional[YOLOStage] = None
 
 
 # ----------------------------
@@ -2820,6 +2996,11 @@ class InferenceWorker(QtCore.QThread):
         self._hf_token = self.cfg.hf_token or get_hf_token_from_env()
         self._fp16_on_mps = bool(self.cfg.fp16_on_mps)
 
+        # YOLO detection settings (alternative to SAM)
+        self._detection_source = getattr(self.cfg, 'detection_source', 'sam')
+        self._yolo_model = getattr(self.cfg, 'yolo_model', 'yolo11m')
+        self._yolo_conf_threshold = float(getattr(self.cfg, 'yolo_conf_threshold', 0.25))
+
         # If FP16 hits an unsupported op, we auto-reload as FP32 once.
         self._did_fp16_fallback = False
 
@@ -2835,6 +3016,27 @@ class InferenceWorker(QtCore.QThread):
             return 16
         # Fall back to configured value
         return max(2, int(self.cfg.vjepa_samples))
+
+    def _ensure_yolo_stage(self) -> Optional[YOLOStage]:
+        """Lazy-load YOLO stage when first needed. Returns None if loading fails."""
+        if self.models.yolo is not None:
+            return self.models.yolo
+
+        try:
+            rt = StageRuntime(device=self.device, dtype=torch.float16, amp_enabled=self._enable_dino)
+            self.models.yolo = YOLOStage(
+                model_id=self._yolo_model,
+                runtime=rt,
+                conf_threshold=self._yolo_conf_threshold,
+            )
+            self._event(f"[yolo] loaded {self._yolo_model}")
+            return self.models.yolo
+        except ImportError as e:
+            self._event(f"[yolo] ultralytics not installed: {e}")
+            return None
+        except Exception as e:
+            self._event(f"[yolo] failed to load {self._yolo_model}: {e}")
+            return None
 
     def set_latest_frame(self, bgr: np.ndarray):
         with QtCore.QMutexLocker(self._frame_lock):
@@ -2854,6 +3056,37 @@ class InferenceWorker(QtCore.QThread):
                 # Keep uniformly spaced frames to maintain temporal coverage
                 idxs = np.linspace(0, len(frames) - 1, num=target).round().astype(int).tolist()
                 self._clip_frames = deque([frames[i] for i in idxs])
+
+
+
+    def _ensure_sam_stage(self) -> Optional['Sam3Stage']:
+        """Lazy-load SAM3 stage only when needed.
+
+        Avoids hard-failing startup when using YOLO detection or when 'transformers'
+        is installed without SAM3 support.
+        """
+        if self.models.sam is not None:
+            return self.models.sam
+        try:
+            rt = self._make_runtime()
+            self._event(f"[models] lazy-loading SAM3: {self.ids.sam3}")
+            self.models.sam = Sam3Stage(self.ids.sam3, rt, hf_token=self._hf_token)
+            self._event("[models] SAM3 loaded")
+            return self.models.sam
+        except ImportError as e:
+            self.models.sam = None
+            self._event(
+                "[sam] SAM3 unavailable in this environment. "
+                "Fix: pip install --upgrade --pre transformers. "
+                "Or set Detection source to YOLO (yolo11/yolo26).\n"
+                f"Details: {e}"
+            )
+            return None
+        except Exception as e:
+            self.models.sam = None
+            tb = traceback.format_exc()
+            self._event(f"[sam] failed to load SAM3 ({self.ids.sam3}): {e}\n{tb}")
+            return None
 
 
     def update_controls(
@@ -2877,6 +3110,9 @@ class InferenceWorker(QtCore.QThread):
         caption_min_tick_gap: Optional[int] = None,
         caption_max_new_tokens: Optional[int] = None,
         caption_num_beams: Optional[int] = None,
+        detection_source: Optional[str] = None,
+        yolo_model: Optional[str] = None,
+        yolo_conf_threshold: Optional[float] = None,
         **kwargs,
     ):
         # Back-compat mapping for the newer UI keyword names.
@@ -2974,6 +3210,33 @@ class InferenceWorker(QtCore.QThread):
             if caption_num_beams is not None:
                 self._caption_num_beams = max(1, int(caption_num_beams))
 
+            # YOLO detection settings
+            if detection_source is not None:
+                if detection_source in ("sam", "yolo11", "yolo26"):
+                    old_source = self._detection_source
+                    self._detection_source = detection_source
+                    # If the user switches YOLO family (yolo11 vs yolo26), keep the size suffix but
+                    # align the model name prefix so the selection does what it says.
+                    if detection_source.startswith("yolo"):
+                        cur = str(getattr(self, "_yolo_model", "yolo11m"))
+                        if not cur.startswith(detection_source):
+                            size = cur[-1] if (len(cur) >= 6 and cur[-1] in "nsmxl") else "m"
+                            self._yolo_model = f"{detection_source}{size}"
+                            self.models.yolo = None
+                    # Clear cached YOLO stage if model family changed
+                    if old_source != detection_source and detection_source.startswith("yolo"):
+                        self.models.yolo = None
+
+            if yolo_model is not None:
+                old_model = self._yolo_model
+                self._yolo_model = str(yolo_model)
+                # Clear cached YOLO stage if model changed
+                if old_model != self._yolo_model:
+                    self.models.yolo = None
+
+            if yolo_conf_threshold is not None:
+                self._yolo_conf_threshold = max(0.01, min(0.99, float(yolo_conf_threshold)))
+
     def _event(self, s: str):
         self.event_signal.emit(s)
 
@@ -2990,10 +3253,15 @@ class InferenceWorker(QtCore.QThread):
                 self.models.dino = DinoV3Stage(self.ids.dino, rt, hf_token=self._hf_token)
                 self._event("[models] DINOv3 loaded")
 
-            if self.cfg.enable_sam:
+            # SAM3 is only needed when detection_source == 'sam'.
+            if self.cfg.enable_sam and getattr(self.cfg, 'detection_source', 'sam') == 'sam':
                 self._event(f"[models] loading SAM3: {self.ids.sam3}")
                 self.models.sam = Sam3Stage(self.ids.sam3, rt, hf_token=self._hf_token)
                 self._event("[models] SAM3 loaded")
+            elif self.cfg.enable_sam:
+                # Keep startup fast and avoid hard-failing when using YOLO as detection source.
+                self.models.sam = None
+                self._event("[models] SAM3 skipped (Detection source != 'sam'); will lazy-load if selected.")
 
             if self.cfg.enable_vjepa:
                 self._event(f"[models] loading V-JEPA2: {self.ids.vjepa2_cls}")
@@ -3169,11 +3437,63 @@ class InferenceWorker(QtCore.QThread):
                         self._reload_models_fp32()
                     else:
                         self._event("[dino] error:\n" + tb)
-            # SAM
+            # Detection (SAM or YOLO based on detection_source setting)
             sam_dets: List[Detection] = []
             union_areas: Dict[str, float] = {}
-            do_sam = (tick_id % max(1, run_sam_n) == 0)
-            if self.models.sam and enable_sam and do_sam:
+            do_detection = (tick_id % max(1, run_sam_n) == 0)
+            detection_source = self._detection_source
+
+            # YOLO detection path
+            if detection_source in ("yolo11", "yolo26") and do_detection:
+                try:
+                    yolo_stage = self._ensure_yolo_stage()
+                    if yolo_stage is not None:
+                        masks, boxes, labels, yolo_info = yolo_stage(bgr)
+                        scores = yolo_info.get("scores", [1.0] * len(boxes))
+
+                        # Create visualization (boxes only, no masks from YOLO)
+                        outs.sam_bgr = draw_boxes(bgr.copy(), boxes, labels, color=(0, 255, 0), thickness=2)
+
+                        # Convert to detections
+                        try:
+                            sam_dets, union_areas = detections_from_yolo(boxes, labels, scores, hw=rgb.shape[:2])
+                            yolo_info['areas'] = union_areas
+                        except Exception:
+                            sam_dets, union_areas = [], {}
+
+                        # Phase 3: compute per-detection DINO embeddings for ReID
+                        try:
+                            if (
+                                sam_dets
+                                and getattr(self.cfg, 'enable_reid', False)
+                                and getattr(self.cfg, 'tracker_use_embedding', True)
+                                and self.models.dino is not None
+                                and enable_dino
+                                and (tick_id % max(1, int(getattr(self.cfg, 'reid_every_n', 2))) == 0)
+                            ):
+                                max_dets = max(1, int(getattr(self.cfg, 'reid_max_dets', 6)))
+                                idxs = sorted(range(len(sam_dets)), key=lambda i: float(sam_dets[i].area_frac), reverse=True)[:max_dets]
+                                boxes_sel = [sam_dets[i].bbox_xyxy for i in idxs]
+                                embs = self.models.dino.embed_boxes(rgb, boxes_sel)
+                                for k, i in enumerate(idxs):
+                                    if k < len(embs):
+                                        sam_dets[i].emb = embs[k]
+                        except Exception:
+                            pass
+
+                        outs.sam_info = yolo_info
+                        outs.sam_counts = {lab: labels.count(lab) for lab in set(labels)}
+                        outs.sam_masks = []  # YOLO doesn't provide masks
+                        outs.sam_boxes = boxes
+                        outs.sam_labels = labels
+                        self._last_sam_dets = sam_dets
+                        self._last_sam_tick = tick_id
+                except Exception:
+                    tb = traceback.format_exc()
+                    self._event(f"[yolo] error:\n" + tb)
+
+            # SAM detection path (default)
+            elif detection_source == "sam" and enable_sam and do_detection and (self._ensure_sam_stage() is not None):
                 try:
                     masks: List[np.ndarray] = []
                     boxes: List[List[float]] = []
@@ -3288,7 +3608,7 @@ class InferenceWorker(QtCore.QThread):
                 # Use cached detections if SAM was skipped (not failed) this tick
                 # This prevents tracker from thinking objects disappeared just because SAM didn't run
                 tracker_dets = sam_dets
-                if not sam_dets and do_sam is False and self._last_sam_dets:
+                if not sam_dets and (not do_detection) and self._last_sam_dets:
                     # SAM was skipped (cadence), reuse last detections
                     tracker_dets = self._last_sam_dets
 
@@ -3846,6 +4166,49 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.tabs.addTab(w_vis, "Visuals")
 
+        # --- Detection tab (SAM vs YOLO)
+        w_detect = QtWidgets.QWidget()
+        f_detect = QtWidgets.QFormLayout(w_detect)
+        f_detect.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.detection_source = QtWidgets.QComboBox()
+        self.detection_source.addItems(["sam", "yolo11", "yolo26"])
+        current_source = str(getattr(self._cfg, "detection_source", "sam"))
+        src_idx = self.detection_source.findText(current_source)
+        if src_idx >= 0:
+            self.detection_source.setCurrentIndex(src_idx)
+
+        self.yolo_model = QtWidgets.QComboBox()
+        self.yolo_model.addItems([
+            "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x",
+            "yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x",
+        ])
+        current_yolo = str(getattr(self._cfg, "yolo_model", "yolo11m"))
+        yolo_idx = self.yolo_model.findText(current_yolo)
+        if yolo_idx >= 0:
+            self.yolo_model.setCurrentIndex(yolo_idx)
+
+        self.yolo_conf = QtWidgets.QDoubleSpinBox()
+        self.yolo_conf.setRange(0.05, 0.95)
+        self.yolo_conf.setSingleStep(0.05)
+        self.yolo_conf.setValue(float(getattr(self._cfg, "yolo_conf_threshold", 0.25)))
+
+        # Note about YOLO
+        yolo_note = QtWidgets.QLabel(
+            "YOLO provides fast object detection with 80 COCO classes.\n"
+            "No segmentation masks - boxes only. Requires 'ultralytics' package.\n"
+            "Models: n=nano(fast), s=small, m=medium, l=large, x=xlarge(accurate)"
+        )
+        yolo_note.setWordWrap(True)
+        yolo_note.setStyleSheet("color:#888;")
+
+        f_detect.addRow("Detection source", self.detection_source)
+        f_detect.addRow("YOLO model", self.yolo_model)
+        f_detect.addRow("YOLO confidence", self.yolo_conf)
+        f_detect.addRow("", yolo_note)
+
+        self.tabs.addTab(w_detect, "Detection")
+
         # --- Cadence / performance tab
         w_perf = QtWidgets.QWidget()
         f_perf = QtWidgets.QFormLayout(w_perf)
@@ -4041,6 +4404,15 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sam_thr.setValue(default_cfg.sam_threshold)
         self.sam_mask_thr.setValue(default_cfg.sam_mask_threshold)
 
+        # Detection tab
+        src_idx = self.detection_source.findText(default_cfg.detection_source)
+        if src_idx >= 0:
+            self.detection_source.setCurrentIndex(src_idx)
+        yolo_idx = self.yolo_model.findText(default_cfg.yolo_model)
+        if yolo_idx >= 0:
+            self.yolo_model.setCurrentIndex(yolo_idx)
+        self.yolo_conf.setValue(default_cfg.yolo_conf_threshold)
+
         # Performance tab
         self.run_dino_n.setValue(default_cfg.run_dino_every_n)
         self.run_sam_n.setValue(default_cfg.run_sam_every_n)
@@ -4122,6 +4494,9 @@ class SettingsDialog(QtWidgets.QDialog):
                     "tracker_use_hungarian": cfg.tracker_use_hungarian,
                     "tracker_graveyard_seconds": cfg.tracker_graveyard_seconds,
                     "timeline_max_items": cfg.timeline_max_items,
+                    "detection_source": cfg.detection_source,
+                    "yolo_model": cfg.yolo_model,
+                    "yolo_conf_threshold": cfg.yolo_conf_threshold,
                 },
                 "model_ids": {
                     "dino": ids.dino,
@@ -4191,6 +4566,15 @@ class SettingsDialog(QtWidgets.QDialog):
             self.sam_thr.setValue(rc.get("sam_threshold", 0.5))
             self.sam_mask_thr.setValue(rc.get("sam_mask_threshold", 0.5))
 
+            # Detection tab (YOLO)
+            det_src_idx = self.detection_source.findText(rc.get("detection_source", "sam"))
+            if det_src_idx >= 0:
+                self.detection_source.setCurrentIndex(det_src_idx)
+            yolo_model_idx = self.yolo_model.findText(rc.get("yolo_model", "yolo11m"))
+            if yolo_model_idx >= 0:
+                self.yolo_model.setCurrentIndex(yolo_model_idx)
+            self.yolo_conf.setValue(rc.get("yolo_conf_threshold", 0.25))
+
             # Performance tab
             self.run_dino_n.setValue(rc.get("run_dino_every_n", 1))
             self.run_sam_n.setValue(rc.get("run_sam_every_n", 1))
@@ -4258,6 +4642,11 @@ class SettingsDialog(QtWidgets.QDialog):
             cfg.dino_blur_ksize += 1  # enforce odd
         cfg.sam_threshold = float(self.sam_thr.value())
         cfg.sam_mask_threshold = float(self.sam_mask_thr.value())
+
+        # Detection source (SAM vs YOLO)
+        cfg.detection_source = str(self.detection_source.currentText())
+        cfg.yolo_model = str(self.yolo_model.currentText())
+        cfg.yolo_conf_threshold = float(self.yolo_conf.value())
 
         cfg.run_dino_every_n = int(self.run_dino_n.value())
         cfg.run_sam_every_n = int(self.run_sam_n.value())

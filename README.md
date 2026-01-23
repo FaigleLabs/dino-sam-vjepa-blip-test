@@ -129,8 +129,25 @@ Generates attention-based saliency heatmaps to identify interesting regions. Thr
 - **magnitude**: Scores by feature activation strength
 - **attention**: Uses transformer attention weights
 
-### 2. SAM3 (Segmentation)
+### 2. SAM3 (Segmentation) - Default
 Segments objects using text prompts (e.g., "person, phone, keyboard") or DINO-proposed bounding boxes.
+- Provides accurate segmentation masks
+- Slower but more detailed output
+
+### 2b. YOLO Detection (Alternative)
+Fast object detection using YOLO11 or YOLO26 models from Ultralytics.
+- **80 COCO classes** including person, car, phone, keyboard, cup, etc.
+- **Much faster** than SAM - good for real-time applications
+- **No segmentation masks** - bounding boxes only
+- Select via Settings > Detection tab
+
+| Model | Size | Speed | Use Case |
+|-------|------|-------|----------|
+| yolo11n/yolo26n | 6MB | Fastest | Real-time, edge devices |
+| yolo11s/yolo26s | 21MB | Fast | Balanced |
+| yolo11m/yolo26m | 39MB | Medium | Default recommendation |
+| yolo11l/yolo26l | 49MB | Slower | Accuracy-focused |
+| yolo11x/yolo26x | 109MB | Slowest | Maximum accuracy |
 
 ### 3. V-JEPA2 (Action Recognition)
 Classifies activities from a rolling video clip buffer. Recognizes actions like typing, waving, picking up objects.
@@ -199,6 +216,9 @@ Two tracking algorithms are available:
 | DINO proposal count | Max proposal boxes (1-20) |
 | DINO min box area | Minimum box size as image fraction |
 | SAM threshold | Confidence threshold for detections |
+| Detection source | sam (default) / yolo11 / yolo26 |
+| YOLO model | Model variant: n/s/m/l/x (default: yolo11m) |
+| YOLO confidence | Detection confidence threshold (default: 0.25) |
 | Enable Tracking | Toggle persistent object IDs |
 | Tracker algorithm | kalman (default) / simple |
 | Use Hungarian | Optimal assignment (requires scipy) |
@@ -250,6 +270,23 @@ All models can be changed in Settings > Models tab.
 | `facebook/sam2.1-hiera-base-plus` | SAM 2.1 | Updated checkpoints |
 | `facebook/sam2.1-hiera-large` | SAM 2.1 | Updated checkpoints |
 
+### YOLO (Object Detection - Alternative to SAM)
+
+| Model ID | Version | Parameters | Notes |
+|----------|---------|------------|-------|
+| `yolo11n` | YOLO11 | 2.5M | Nano - fastest, edge devices |
+| `yolo11s` | YOLO11 | 9.4M | Small - fast |
+| `yolo11m` | YOLO11 | 20M | Medium (default) |
+| `yolo11l` | YOLO11 | 25M | Large - more accurate |
+| `yolo11x` | YOLO11 | 57M | Extra large - most accurate |
+| `yolo26n` | YOLO26 | ~3M | Nano - 2025 architecture |
+| `yolo26s` | YOLO26 | ~10M | Small - 2025 architecture |
+| `yolo26m` | YOLO26 | ~22M | Medium - 2025 architecture |
+| `yolo26l` | YOLO26 | ~27M | Large - 2025 architecture |
+| `yolo26x` | YOLO26 | ~60M | Extra large - 2025 architecture |
+
+**Note:** YOLO models detect 80 COCO classes (person, car, phone, keyboard, cup, etc.). No segmentation masks - bounding boxes only.
+
 ### V-JEPA (Video Action Classification)
 
 | Model ID | Size | Resolution | Notes |
@@ -284,9 +321,10 @@ All models can be changed in Settings > Models tab.
 
 1. **Lower inference FPS** for smoother UI (1-2 FPS is usually sufficient)
 2. **Disable V-JEPA** if you don't need action recognition (biggest speedup)
-3. **Use --fp16** for ~2x faster inference on compatible GPUs
-4. **Reduce max-width** to process smaller frames
-5. **Increase stage cadence** (run DINO/SAM every N ticks instead of every tick)
+3. **Use YOLO instead of SAM** for much faster detection (no masks, boxes only)
+4. **Use --fp16** for ~2x faster inference on compatible GPUs
+5. **Reduce max-width** to process smaller frames
+6. **Increase stage cadence** (run DINO/SAM every N ticks instead of every tick)
 
 ## Troubleshooting
 

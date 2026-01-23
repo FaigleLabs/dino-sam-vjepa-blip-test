@@ -86,3 +86,4 @@ htmlcov/
 
 # CLAUDE.md (development notes)
 CLAUDE.md
+set_hf_token
